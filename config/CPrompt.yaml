@@ -1,0 +1,71 @@
+image_size: 224
+
+# 任务配置
+init_cls_num: 10
+inc_cls_num: 10
+total_cls_num: 100
+task_num: 10
+
+# 训练配置
+epoch: 170
+val_per_epoch: 10
+train_batch_size: 16
+test_batch_size: 16
+
+seed: 1993
+deterministic: True
+
+# 数据转换
+train_trfms:
+  - RandomResizedCrop:
+      size: 224
+      scale: [0.05, 1.0]
+      ratio: [0.75, 1.33333333]
+  - RandomHorizontalFlip: {}
+  - ToTensor: {}
+  - Normalize:
+      mean: [0.5071, 0.4866, 0.4409]
+      std: [0.2009, 0.1984, 0.2023]
+
+test_trfms: 
+  - Resize:
+      size: 224
+      interpolation: BICUBIC
+  - ToTensor: {}
+  - Normalize:
+      mean: [0.5071, 0.4866, 0.4409]
+      std: [0.2009, 0.1984, 0.2023]
+
+# 优化器配置
+optimizer:
+  name: SGD
+  kwargs:
+    lr: 0.01
+    momentum: 0.9
+    weight_decay: 5e-4
+
+# 学习率调度器
+lr_scheduler:
+  name: CosineAnnealingLR
+  kwargs:
+    T_max: 170  # 与epoch数一致
+
+# 骨干网络配置
+backbone:
+  name: vit_pt_imnet
+  kwargs:
+    num_classes: 100
+    pretrained: true
+    model_name: vit_base_patch16_224
+
+# 分类器配置
+classifier:
+  name: CPrompt
+  kwargs:
+    num_class: 100
+    feat_dim: 768  # ViT-B/16的特征维度
+    init_cls_num: 10  # 初始类别数
+    inc_cls_num: 10   # 每任务增加的类别数
+    margin: 0.1       # CCL损失边界
+    tau: 1.1          # CCL温度参数
+    alpha: 1.0        # CCL损失权重

@@ -25,7 +25,7 @@ import torch.nn as nn
 from torch.nn import Parameter
 import torch.nn.functional as F
 from .finetune import Finetune
-from core.model.backbone.resnet import *
+from core.model.backbone.resnet import CosineLinear
 import numpy as np
 from torch.utils.data import DataLoader
 

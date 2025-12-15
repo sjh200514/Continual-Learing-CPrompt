@@ -471,15 +471,16 @@ class VisionTransformer(nn.Module):
         final_chs = self.representation_size if self.representation_size else self.embed_dim
         self.head = nn.Linear(final_chs, num_classes) if num_classes > 0 else nn.Identity()
 
-    def forward_features(self, x):
+    def forward_features(self, x, task=0):
         x = self.patch_embed(x)
         x = torch.cat((self.cls_token.expand(x.shape[0], -1, -1), x), dim=1)
 
         x = self.pos_drop(x + self.pos_embed)
         if self.grad_checkpointing and not torch.jit.is_scripting():
-            x = checkpoint_seq(self.blocks, x)
+            x = checkpoint_seq(lambda y: self.blocks(y, task), x)
         else:
-            x = self.blocks(x)
+            for block in self.blocks:
+                x = block(x, task)
         x = self.norm(x)
         return x
 
@@ -506,9 +507,9 @@ class VisionTransformer(nn.Module):
         x = self.pre_logits(x)
         return x if pre_logits else self.head(x)
 
-    def forward(self, x, grow_flag=False, numcls=0):
+    def forward(self, x, task=0, grow_flag=False, numcls=0):
         if not grow_flag:
-            x = self.forward_features(x)
+            x = self.forward_features(x, task=task)
         else:
             x = self.forward_features_grow(x, numcls)
 

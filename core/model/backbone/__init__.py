@@ -8,6 +8,8 @@ from .SiNet import SiNet_vit
 from .resnet_cbam import *
 from .alexnet import AlexNet_TRGP, AlexNet_API
 from .clip import clip
+from .vit_inflora import VisionTransformer
+from core.model.CPrompt import CPrompt
 
 def get_backbone(config):
     """

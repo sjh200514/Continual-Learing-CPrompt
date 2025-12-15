@@ -72,4 +72,5 @@ if __name__ == "__main__":
         pass
         os.environ["CUDA_VISIBLE_DEVICES"] = config["device_ids"]
     else:
+        config["device_ids"] = [0]
         main(0, config)
