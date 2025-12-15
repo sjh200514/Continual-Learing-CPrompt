@@ -3,4 +3,4 @@
 
 我在已有的LibContinual框架下添加了两个代码文件，分别是 `CPrompt.py`和`CPrompt.yaml`。`CPrompt.py`是核心算法文件，而`CPrompt.yaml`则是CPrompt算法的配置文件。
 
-最后在Cifar100数据集上并没有达到论文中的精度，比论文中的精度低2-3个百分点。
+最后在CIFAR-100数据集上并没有达到论文中的精度，比论文中的精度低2-3个百分点。
