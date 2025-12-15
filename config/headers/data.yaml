@@ -1,6 +1,10 @@
 save_path: ''
 dataset: cifar100 # [cifar100, binary_cifar100, ...]
+<<<<<<< HEAD
 data_root: /home/sjh/dataset/cifar100
+=======
+data_root: /data/lqx/cifar100
+>>>>>>> a399ed4b0058e064871a212588118b97a1e4dfac
 image_size: 32
 pin_memory: False
 augment: True

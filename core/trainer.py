@@ -9,6 +9,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from pprint import pprint
+from contextlib import redirect_stdout
 from time import time
 from tqdm import tqdm
 from core.data import get_dataloader
@@ -40,7 +41,11 @@ class Trainer(object):
         self.logger = self._init_logger(config)           
         self.device = self._init_device(config)
 
-        pprint(config)
+        #pprint(config)
+        # Write config into log file only
+        with redirect_stdout(self.logger.file):
+            pprint(config)
+        
         
         self.init_cls_num, self.inc_cls_num, self.task_num = self._init_data(config)
         self.model = self._init_model(config) 
@@ -78,13 +83,12 @@ class Trainer(object):
         '''
 
         save_path = config['save_path']
-        log_path = os.path.join(save_path, "log")
-        if not os.path.isdir(log_path):
-            os.mkdir(log_path)
-        log_prefix = config['classifier']['name'] + "-" + config['backbone']['name'] + "-" + f"epoch{config['epoch']}" #mode
-        log_prefix = log_prefix.replace("/", "-")
-        log_file = os.path.join(log_path, "{}-{}.log".format(log_prefix, fmt_date_str()))
 
+        log_path = os.path.join(save_path, "log", config['classifier']['name'])
+        os.makedirs(log_path, exist_ok=True)
+        
+        log_prefix = f"{config['dataset']}..{config['backbone']['name']}--ep{config['epoch']}--s{config['seed']}__{datetime.now().strftime('%Y-%m-%d_%H-%M')}"
+        log_file = os.path.join(log_path, f"{log_prefix}.log")
         logger = Logger(log_file)
 
         # hack sys.stdout
@@ -260,8 +264,14 @@ class Trainer(object):
         method_name = self.config["classifier"]["name"]
         testing_times = self.config['testing_times']
 
-        avg_acc_list = np.zeros((self.task_num))
-        best_avg_acc_list = np.zeros((self.task_num))
+        # 记录每个 task 的 average last accuracy
+        batch_last_acc_list = np.zeros((self.task_num))
+        task_last_acc_list = np.zeros((self.task_num))
+
+        # 记录每个 task 的 best last accuracy
+        best_batch_last_acc_list = np.zeros((self.task_num))
+        best_task_last_acc_list = np.zeros((self.task_num))
+
         acc_table = np.zeros((self.task_num, self.task_num)) # A numpy array with shape [task_num, task_num], where [i, j] is acc of model on task j after learning task i
         bwt_list, frgt_list = [], []
 
@@ -290,12 +300,19 @@ class Trainer(object):
                 self.optimizer = optim.SGD(model.get_parameters(self.config), lr = 0.1, momentum = 0.9, weight_decay = w_decay)
                 self.scheduler = MultiStepLR(self.optimizer, milestones = [100, 150, 200], gamma = 0.1)
 
-                dataloader, val_bias_dataloader = bic.spilt_and_update11(dataloader, self.buffer, task_idx, self.config)
+                dataloader, val_bias_dataloader = self.model.spilt_and_update(dataloader, self.buffer, task_idx, self.config)
 
             elif isinstance(self.buffer, (LinearBuffer, LinearHerdingBuffer)) and self.buffer.buffer_size > 0 and task_idx > 0:
                 datasets = dataloader.dataset
-                datasets.images.extend(self.buffer.images)
-                datasets.labels.extend(self.buffer.labels)
+                if isinstance(datasets.images, list):
+                    datasets.images.extend(self.buffer.images)
+                    datasets.labels.extend(self.buffer.labels)
+                elif isinstance(datasets.images, np.ndarray):
+                    datasets.images = np.concatenate((datasets.images, self.buffer.images), axis=0)
+                    datasets.labels = np.concatenate((datasets.labels, self.buffer.labels), axis=0)
+                else:
+                    assert 0
+
                 dataloader = DataLoader(
                     datasets,
                     shuffle = True,
@@ -303,12 +320,23 @@ class Trainer(object):
                     drop_last = False,
                     num_workers = self.config['num_workers']
                 )
+            
+            if method_name in ["LoRAsub_DRS"]:
+                print('Replacing Optim & Scheduler')
+                self.optimizer = self.model.get_optimizer(self.config['optimizer']['kwargs']['lr'], self.config['optimizer']['kwargs']['weight_decay'])
+                self.scheduler = CosineSchedule(self.optimizer, K=self.config['epoch'])
+
+            if method_name == 'CL_LoRA':
+                self.model.set_optim(self.optimizer)
 
             if self.rank == 0:
                 print(f"================Task {task_idx} Training!================")
                 print(f"The training samples number : {len(dataloader.dataset)}")
+            
+            # Reset Best Record
+            best_batch_last_acc, best_task_last_acc = 0., 0.
+            best_bwt, best_frgt = float('-inf'), float('inf')
 
-            best_avg_acc, best_bwt, best_frgt = 0., float('-inf'), float('inf')
             for epoch_idx in range(self.init_epoch if task_idx == 0 else self.inc_epoch):
                 if self.rank == 0:
                     print("================Train on train set================")
@@ -336,24 +364,35 @@ class Trainer(object):
                         print(f"================Validation on test set================")
 
                     # Disable validation for some method
-                    #if method_name in ['TRGP', 'RanPAC', 'MInfLoRA', 'MInfLoRA2', 'MInfLoRA3', 'PRAKA', 'TRGP_CLIP'] or 'MInfLoRA' in method_name:
-                    if method_name in ['TRGP', 'RanPAC', 'MInfLoRA2', 'MInfLoRA3', 'PRAKA', 'TRGP_CLIP']:
+                    if method_name in ['TRGP', 
+                                       'RanPAC', 
+                                       'MInfLoRA2', 
+                                       'MInfLoRA3', 
+                                       'PRAKA', 
+                                       'TRGP_CLIP', 
+                                       'LoRAsub_DRS',
+                                       'CL_LoRA'
+                        ]:
                         if self.rank == 0:
                             print(f" * Disabled validation for this method")
                     else:
                         test_acc = self._validate(task_idx)
 
-                        avg_acc, per_task_acc = test_acc['avg_acc'], test_acc['per_task_acc']
-                        best_avg_acc = max(avg_acc, best_avg_acc)
+                        batch_last_acc, per_task_acc = test_acc['avg_acc'], test_acc['per_task_acc']
+                        best_batch_last_acc = max(batch_last_acc, best_batch_last_acc)
+
+                        task_last_acc = np.mean(per_task_acc)
+                        best_task_last_acc = max(task_last_acc, best_task_last_acc)
 
                         frgt, bwt = compute_frgt(acc_table, per_task_acc, task_idx), compute_bwt(acc_table, per_task_acc, task_idx)
                         best_frgt, best_bwt = min(frgt, best_frgt), max(bwt, best_bwt)
 
                         if self.rank == 0:
-                            print(f" * [Batch] Last Average Acc (Best Last Average Acc) : {avg_acc:.2f} ({best_avg_acc:.2f})")
-                            print(f" * Forgetting (Best Forgetting) : {frgt:.3f} ({best_frgt:.3f})")
-                            print(f" * Backward Transfer (Best Backward Transfer) : {bwt:.2f} ({best_bwt:.2f})")
-                            print(f" * Per-Task Acc : {per_task_acc}")
+                            print(f" * [Batch] Last Average Acc: {batch_last_acc:.2f} (Best: {best_batch_last_acc:.2f})")
+                            print(f" * [Task] Last Average Acc: {task_last_acc:.2f} (Best: {best_task_last_acc:.2f})")
+                            print(f" * Forgetting: {frgt:.3f} (Best: {best_frgt:.3f})")
+                            print(f" * Backward Transfer: {bwt:.2f} (Best: {best_bwt:.2f})")
+                            print(f" * Per-Task Acc: {per_task_acc}")
             
                 if self.config['lr_scheduler']['name'] == "PatienceSchedule":
                     self.scheduler.step(train_meter.avg('loss'))
@@ -397,18 +436,22 @@ class Trainer(object):
 
                         test_acc = self._validate(task_idx)
 
-                        avg_acc, per_task_acc = test_acc['avg_acc'], test_acc['per_task_acc']
-                        best_avg_acc = max(avg_acc, best_avg_acc)
+                        batch_last_acc, per_task_acc = test_acc['avg_acc'], test_acc['per_task_acc']
+                        best_batch_last_acc = max(batch_last_acc, best_batch_last_acc)
+
+                        task_last_acc = np.mean(per_task_acc)
+                        best_task_last_acc = max(task_last_acc, best_task_last_acc)
 
                         frgt, bwt = compute_frgt(acc_table, per_task_acc, task_idx), compute_bwt(acc_table, per_task_acc, task_idx)
                         best_frgt, best_bwt = min(frgt, best_frgt), max(bwt, best_bwt)
 
                         if self.rank == 0:
-                            print(f" * [Batch] Last Average Acc (Best Last Average Acc) : {avg_acc:.2f} ({best_avg_acc:.2f})")
-                            print(f" * Forgetting (Best Forgetting) : {frgt:.3f} ({best_frgt:.3f})")
-                            print(f" * Backward Transfer (Best Backward Transfer) : {bwt:.2f} ({best_bwt:.2f})")
-                            print(f" * Per-Task Acc : {per_task_acc}")
-            
+                            print(f" * [Batch] Last Average Acc: {batch_last_acc:.2f} (Best: {best_batch_last_acc:.2f})")
+                            print(f" * [Task] Last Average Acc: {task_last_acc:.2f} (Best: {best_task_last_acc:.2f})")
+                            print(f" * Forgetting: {frgt:.3f} (Best: {best_frgt:.3f})")
+                            print(f" * Backward Transfer: {bwt:.2f} (Best: {best_bwt:.2f})")
+                            print(f" * Per-Task Acc: {per_task_acc}")
+
                     #bias_scheduler.step()
 
             for test_idx in range(testing_times):
@@ -416,28 +459,37 @@ class Trainer(object):
                     print(f"================Test {test_idx+1}/{testing_times} of Task {task_idx}!================")
 
                 test_acc = self._validate(task_idx)
-                avg_acc, per_task_acc = test_acc['avg_acc'], test_acc['per_task_acc']
-                best_avg_acc = max(avg_acc, best_avg_acc)
+
+                batch_last_acc, per_task_acc = test_acc['avg_acc'], test_acc['per_task_acc']
+                best_batch_last_acc = max(batch_last_acc, best_batch_last_acc)
+
+                task_last_acc = np.mean(per_task_acc)
+                best_task_last_acc = max(task_last_acc, best_task_last_acc)
 
                 frgt, bwt = compute_frgt(acc_table, per_task_acc, task_idx), compute_bwt(acc_table, per_task_acc, task_idx)
                 best_frgt, best_bwt = min(frgt, best_frgt), max(bwt, best_bwt)
 
                 if self.rank == 0:
-                    print(f" * [Batch] Last Average Acc (Best Last Average Acc) : {avg_acc:.2f} ({best_avg_acc:.2f})")
-                    print(f" * Forgetting (Best Forgetting) : {frgt:.3f} ({best_frgt:.3f})")
-                    print(f" * Backward Transfer (Best Backward Transfer) : {bwt:.2f} ({best_bwt:.2f})")
-                    print(f" * Per-Task Acc : {per_task_acc}")
+                    print(f" * [Batch] Last Average Acc: {batch_last_acc:.2f} (Best: {best_batch_last_acc:.2f})")
+                    print(f" * [Task] Last Average Acc: {task_last_acc:.2f} (Best: {best_task_last_acc:.2f})")
+                    print(f" * Forgetting: {frgt:.3f} (Best: {best_frgt:.3f})")
+                    print(f" * Backward Transfer: {bwt:.2f} (Best: {best_bwt:.2f})")
+                    print(f" * Per-Task Acc: {per_task_acc}")
 
-                avg_acc_list[task_idx] += avg_acc
+                batch_last_acc_list[task_idx] += batch_last_acc # avg_acc_list[task_idx] += avg_acc
+                task_last_acc_list[task_idx] += task_last_acc
                 acc_table[task_idx][:task_idx + 1] += np.array(per_task_acc)
 
-            # Take mean of testing_times
-            best_avg_acc_list[task_idx] = best_avg_acc
-            avg_acc_list[task_idx] /= testing_times 
-            acc_table[task_idx] /= testing_times 
+            best_batch_last_acc_list[task_idx] = best_batch_last_acc
+            best_task_last_acc_list[task_idx] = best_task_last_acc
 
-            #avg_acc = np.mean(acc_table[task_idx][:task_idx + 1])
-            avg_acc = avg_acc_list[task_idx]
+            # Take mean of testing_times
+            batch_last_acc_list[task_idx] /= testing_times
+            task_last_acc_list[task_idx] /= testing_times
+            acc_table[task_idx] /= testing_times
+
+            batch_last_acc = batch_last_acc_list[task_idx]
+            task_last_acc = task_last_acc_list[task_idx]
 
             frgt, bwt = compute_frgt(acc_table, acc_table[task_idx], task_idx), compute_bwt(acc_table, acc_table[task_idx], task_idx)
             best_frgt, best_bwt = min(frgt, best_frgt), max(bwt, best_bwt)
@@ -447,13 +499,15 @@ class Trainer(object):
                 
             if self.rank == 0:
                 print(f"================Result of Task {task_idx} Testing!================")
-                print(f" * [Batch] Last Average Acc (Best Last Average Acc) : {avg_acc:.2f} ({best_avg_acc:.2f})")
-                print(f" * Forgetting (Best Forgetting) : {frgt:.3f} ({best_frgt:.3f})")
-                print(f" * Backward Transfer (Best Backward Transfer) : {bwt:.2f} ({best_bwt:.2f})")
-                print(f" * Per-Task Acc : {acc_table[task_idx][:task_idx + 1]}")
+                print(f" * [Batch] Last Average Acc: {batch_last_acc:.2f} (Best: {best_batch_last_acc:.2f})")
+                print(f" * [Task] Last Average Acc: {task_last_acc:.2f} (Best: {best_task_last_acc:.2f})")
+                print(f" * Forgetting: {frgt:.3f} (Best: {best_frgt:.3f})")
+                print(f" * Backward Transfer: {bwt:.2f} (Best: {best_bwt:.2f})")
+                print(f" * Per-Task Acc: {acc_table[task_idx][:task_idx + 1]}")
 
-        batch_ovr_avg_acc = np.mean(avg_acc_list)
-        best_batch_ovr_avg_acc = np.mean(best_avg_acc_list)
+        batch_ovr_avg_acc = np.mean(batch_last_acc_list) #batch_ovr_avg_acc = np.mean(avg_acc_list)
+        best_batch_ovr_avg_acc = np.mean(best_batch_last_acc_list) # best_batch_ovr_avg_acc = np.mean(best_avg_acc_list)
+         
         task_ovr_avg_acc = np.sum(np.sum(acc_table[:task_idx + 1], axis = 1) / np.arange(1, task_idx + 2)) / (task_idx + 1)
         
         ovr_bwt = np.mean(bwt_list) if len(bwt_list) > 0 else float('-inf')
@@ -461,10 +515,11 @@ class Trainer(object):
 
         if self.rank == 0:
             print(f"================Overall Result of {self.task_num} Tasks!================")
-            print(f" * [Batch] Last Average Acc (Best Last Average Acc) : {avg_acc:.2f} ({best_avg_acc:.2f})")
-            print(f" * Forgetting (Best Forgetting) : {frgt:.3f} ({best_frgt:.3f})")
-            print(f" * Backward Transfer (Best Backward Transfer) : {bwt:.2f} ({best_bwt:.2f})")
-            print(f" * [Batch] Overall Avg Acc : {batch_ovr_avg_acc:.2f} ({best_batch_ovr_avg_acc:.2f})")
+            print(f" * [Batch] Last Average Acc: {batch_last_acc:.2f} (Best: {best_batch_last_acc:.2f})")
+            print(f" * [Task] Last Average Acc: {task_last_acc:.2f} (Best: {best_task_last_acc:.2f})")
+            print(f" * Forgetting: {frgt:.3f} (Best: {best_frgt:.3f})")
+            print(f" * Backward Transfer: {bwt:.2f} (Best: {best_bwt:.2f})")
+            print(f" * [Batch] Overall Avg Acc : {batch_ovr_avg_acc:.2f} (Best: {best_batch_ovr_avg_acc:.2f})")
             print(f" * [Task] Overall Avg Acc : {task_ovr_avg_acc:.2f}")
             print(f" * Overall Frgt : {ovr_frgt:.3f}")
             print(f" * Overall BwT : {ovr_bwt:.2f}")
@@ -528,8 +583,9 @@ class Trainer(object):
         total = len(dataloader)
         init_seed(self.config['seed'] + epoch_idx, self.config['deterministic']) # Ensure Reproducibility
         for b, batch in tqdm(enumerate(dataloader), total=total, disable=(self.rank != 0)):
-
+            
             batch['batch_id'] = b
+
             # These method's LR is updated every iterations, not epochs
             if self.config['classifier']['name'] in ['MOE_ADAPTER4CL', 'DMNSP', 'DMNSP_CIL']:
                 self.scheduler.step(total * epoch_idx + b)
@@ -562,42 +618,103 @@ class Trainer(object):
         dataloaders = self.test_loader.get_loader(task_idx)
 
         model = self.model.module if self.distribute else self.model
-
         model.eval()
+
         if self.config["classifier"]["name"] == 'bic':
             for layer in model.bias_layers:
                 layer.eval()
 
         per_task_acc = []
-        correct_task, correct_all = 0, 0
-        count_task, count_all = 0, 0
+        count_all, correct_all = 0, 0
 
-        with torch.no_grad():
-            for t, dataloader in enumerate(dataloaders):
-                correct_task, count_task = 0, 0
+        if self.config['testing_per_task']:
 
-                for batch in tqdm(dataloader, desc = f"Testing on Task {t} data", disable=self.rank != 0):  # Disable tqdm for non-master processes
-                    
+            count_task, correct_task = 0, 0
+
+            with torch.no_grad():
+                for t, dataloader in enumerate(dataloaders):
+                    correct_task, count_task = 0, 0
+
+                    for b, batch in tqdm(enumerate(dataloader), total=len(dataloader), desc = f"Testing on Task {t} data", disable=self.rank != 0):  # Disable tqdm for non-master processes
+                        
+                        if self.config['setting'] == 'task-aware':
+                            output, acc = model.inference(batch, task_id=t)
+                        elif self.config['setting'] == 'task-agnostic':
+                            output, acc = model.inference(batch)
+                        
+                        correct_task += int(acc * batch['label'].shape[0])
+                        count_task += batch['label'].shape[0]
+
+                    correct_all += correct_task
+                    count_all += count_task
+
+                    if self.distribute:
+                        pass
+
+                    per_task_acc.append(round(correct_task * 100 / count_task, 2))
+
+            if self.distribute:
+                pass
+
+        else:
+
+            datasets = [dl.dataset for dl in dataloaders]
+
+            all_images = np.concatenate([ds.images for ds in datasets], axis=0)
+            all_labels = np.concatenate([ds.labels for ds in datasets], axis=0)
+
+            merged_dataset = copy.deepcopy(datasets[0])
+            merged_dataset.images = all_images
+            merged_dataset.labels = all_labels
+
+            merged_loader = DataLoader(
+                    merged_dataset,
+                    shuffle = True,
+                    batch_size = self.config['batch_size'],
+                    drop_last = False,
+                    num_workers = self.config['num_workers'],
+                    pin_memory=False
+                )
+
+            class_boundaries = []
+            start_cls = 0
+            for t in range(task_idx + 1):
+                n_cls = self.init_cls_num if t == 0 else self.inc_cls_num
+                class_boundaries.append((start_cls, start_cls + n_cls))
+                start_cls += n_cls
+
+            correct_by_task = np.zeros(task_idx + 1, dtype=int)
+            count_by_task = np.zeros(task_idx + 1, dtype=int)
+
+            # 4. 推理
+            with torch.no_grad():
+                for b, batch in tqdm(enumerate(merged_loader), total=len(merged_loader), desc=f"Testing merged tasks <= {task_idx}", disable=self.rank != 0):
+
                     if self.config['setting'] == 'task-aware':
-                        output, acc = model.inference(batch, task_id=t)
+                        print('Mostly methods dont support this, set testing_per_task to False')
+                        raise NotImplementedError
+                        output, acc = model.inference(batch, task_id=None)
                     elif self.config['setting'] == 'task-agnostic':
                         output, acc = model.inference(batch)
-                    
-                    correct_task += int(acc * batch['label'].shape[0])
-                    count_task += batch['label'].shape[0]
+                    preds = output.cpu().numpy()
 
-                correct_all += correct_task
-                count_all += count_task
+                    labels = batch['label'].cpu().numpy()
+                    correct_all += np.sum(preds == labels)
 
-                if self.distribute:
-                    pass
+                    count_all += len(labels)
 
-                per_task_acc.append(round(correct_task * 100 / count_task, 2))
+                    # 统计每个 task 的正确率
+                    for t, (start, end) in enumerate(class_boundaries):
+                        mask = (labels >= start) & (labels < end)
+                        if np.any(mask):
+                            correct_by_task[t] += np.sum(preds[mask] == labels[mask])
+                            count_by_task[t] += np.sum(mask)
 
-        if self.distribute:
-            pass
+            per_task_acc = [round(c * 100 / n, 2) if n > 0 else 0 for c, n in zip(correct_by_task, count_by_task)]
 
         avg_acc = round(correct_all * 100 / count_all, 2)
 
-        return {"avg_acc": avg_acc, 
-                "per_task_acc": per_task_acc}
+        return {
+            "avg_acc": avg_acc,
+            "per_task_acc": per_task_acc
+        }
